@@ -3,12 +3,17 @@
 namespace KumaGames\GamePlayerManager\Services;
 
 use App\Models\Server;
+use Illuminate\Support\Carbon;
+use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\Log;
 use KumaGames\GamePlayerManager\Services\Nbt\NbtService;
 use Throwable;
 
 class MinecraftPlayerProvider implements GamePlayerService
 {
+    private const ONLINE_PLAYERS_CACHE_SECONDS = 10;
+    private const ONLINE_PLAYERS_RCON_FALLBACK_CACHE_SECONDS = 30;
+
     private NbtService $nbtService;
 
     /** @var array<string, array<string, string>> */
@@ -61,6 +66,9 @@ class MinecraftPlayerProvider implements GamePlayerService
                 'online' => false,
                 'is_op' => true,
                 'is_banned' => false,
+                'is_whitelisted' => false,
+                'last_connection_at' => null,
+                'last_activity_at' => null,
             ];
         }
 
@@ -73,11 +81,33 @@ class MinecraftPlayerProvider implements GamePlayerService
                     'online' => false,
                     'is_op' => isset($opNames[$lowerName]),
                     'is_banned' => true,
+                    'is_whitelisted' => false,
+                    'last_connection_at' => null,
+                    'last_activity_at' => null,
                 ];
                 continue;
             }
 
             $allPlayers[$lowerName]['is_banned'] = true;
+        }
+
+        $whitelistNames = $this->readWhitelistNames($fileRepository);
+        foreach ($whitelistNames as $lowerName => $name) {
+            if (!isset($allPlayers[$lowerName])) {
+                $allPlayers[$lowerName] = [
+                    'id' => $name,
+                    'name' => $name,
+                    'online' => false,
+                    'is_op' => isset($opNames[$lowerName]),
+                    'is_banned' => isset($bannedNames[$lowerName]),
+                    'is_whitelisted' => true,
+                    'last_connection_at' => null,
+                    'last_activity_at' => null,
+                ];
+                continue;
+            }
+
+            $allPlayers[$lowerName]['is_whitelisted'] = true;
         }
 
         $cachedPlayers = $this->readJsonFile($fileRepository, 'usercache.json');
@@ -88,7 +118,16 @@ class MinecraftPlayerProvider implements GamePlayerService
             }
 
             $lowerName = strtolower($name);
+            $lastSeenAt = $this->parseLastSeenFromUserCache($player['expiresOn'] ?? null);
+
             if (isset($allPlayers[$lowerName])) {
+                if ($lastSeenAt !== null) {
+                    $allPlayers[$lowerName]['last_connection_at'] = $lastSeenAt;
+                    if (empty($allPlayers[$lowerName]['last_activity_at'])) {
+                        $allPlayers[$lowerName]['last_activity_at'] = $lastSeenAt;
+                    }
+                }
+
                 continue;
             }
 
@@ -98,10 +137,15 @@ class MinecraftPlayerProvider implements GamePlayerService
                 'online' => false,
                 'is_op' => isset($opNames[$lowerName]),
                 'is_banned' => isset($bannedNames[$lowerName]),
+                'is_whitelisted' => isset($whitelistNames[$lowerName]),
+                'last_connection_at' => $lastSeenAt,
+                'last_activity_at' => $lastSeenAt,
             ];
         }
 
         $onlinePlayers = $this->getOnlinePlayers($server);
+        $nowIso = now()->toIso8601String();
+
         foreach ($onlinePlayers as $playerName) {
             $lowerName = strtolower($playerName);
 
@@ -112,15 +156,39 @@ class MinecraftPlayerProvider implements GamePlayerService
                     'online' => true,
                     'is_op' => isset($opNames[$lowerName]),
                     'is_banned' => isset($bannedNames[$lowerName]),
+                    'is_whitelisted' => isset($whitelistNames[$lowerName]),
+                    'last_connection_at' => $nowIso,
+                    'last_activity_at' => $nowIso,
                 ];
                 continue;
             }
 
             $allPlayers[$lowerName]['online'] = true;
+            $allPlayers[$lowerName]['is_whitelisted'] = isset($whitelistNames[$lowerName]);
+            $allPlayers[$lowerName]['last_activity_at'] = $nowIso;
+            if (empty($allPlayers[$lowerName]['last_connection_at'])) {
+                $allPlayers[$lowerName]['last_connection_at'] = $nowIso;
+            }
         }
 
+        foreach ($allPlayers as &$player) {
+            $player['is_whitelisted'] = !empty($player['is_whitelisted']);
+            $player['last_connection_at'] = $player['last_connection_at'] ?? null;
+            $player['last_activity_at'] = $player['last_activity_at'] ?? $player['last_connection_at'];
+        }
+        unset($player);
+
         $players = array_values($allPlayers);
-        usort($players, fn (array $a, array $b) => strcasecmp((string) ($a['name'] ?? ''), (string) ($b['name'] ?? '')));
+        usort($players, static function (array $a, array $b): int {
+            $aOnline = !empty($a['online']);
+            $bOnline = !empty($b['online']);
+
+            if ($aOnline !== $bOnline) {
+                return $aOnline ? -1 : 1;
+            }
+
+            return strcasecmp((string) ($a['name'] ?? ''), (string) ($b['name'] ?? ''));
+        });
 
         return $players;
     }
@@ -134,10 +202,12 @@ class MinecraftPlayerProvider implements GamePlayerService
 
         $fileRepository = $this->getFileRepository($server);
         $uuid = $this->resolveUuidFromUsercache($fileRepository, $playerId);
+        $lastConnectionAt = $this->resolveLastSeenFromUsercache($fileRepository, $playerId);
         $lowerPlayerId = strtolower($playerId);
 
         $opNames = $this->readNamedList($fileRepository, 'ops.json');
         $bannedNames = $this->readNamedList($fileRepository, 'banned-players.json');
+        $whitelistNames = $this->readWhitelistNames($fileRepository);
 
         $onlinePlayers = array_map('strtolower', $this->getOnlinePlayers($server));
         $isOnline = in_array($lowerPlayerId, $onlinePlayers, true);
@@ -149,6 +219,7 @@ class MinecraftPlayerProvider implements GamePlayerService
             'status' => $isOnline ? 'Online' : 'Offline',
             'is_op' => isset($opNames[$lowerPlayerId]),
             'is_banned' => isset($bannedNames[$lowerPlayerId]),
+            'is_whitelisted' => isset($whitelistNames[$lowerPlayerId]),
             'raw_stats' => $isOnline ? 'Online' : 'Offline',
             'health' => null,
             'food' => null,
@@ -160,9 +231,13 @@ class MinecraftPlayerProvider implements GamePlayerService
             'walk_distance' => null,
             'mobs_killed' => null,
             'deaths' => null,
+            'last_connection_at' => $lastConnectionAt,
+            'last_activity_at' => $isOnline ? now()->toIso8601String() : $lastConnectionAt,
         ];
 
-        if ($this->isRconEnabled()) {
+        $useLiveDetails = $this->shouldUseRconForLiveDetails();
+
+        if ($useLiveDetails) {
             $liveDetails = $this->getLiveDetailsViaRcon($server, $playerId);
             if ($liveDetails !== null) {
                 $details = array_merge($details, $liveDetails);
@@ -175,7 +250,7 @@ class MinecraftPlayerProvider implements GamePlayerService
             $nbtDetails = $this->getOfflineDetailsFromNbt($server, $uuid ?? $playerId);
             if (!empty($nbtDetails)) {
                 $details = array_merge($details, $nbtDetails);
-                $details['raw_stats'] = $this->isRconEnabled()
+                $details['raw_stats'] = $useLiveDetails
                     ? 'Offline (Data from Save File)'
                     : 'RconDisabled';
             }
@@ -222,6 +297,84 @@ class MinecraftPlayerProvider implements GamePlayerService
         return $this->sendRconCommand($serverId, "clear {$playerId}") !== null;
     }
 
+    public function addToWhitelist(string $serverId, string $playerName): bool
+    {
+        $server = $this->resolveServer($serverId, true);
+        if (!$server) {
+            return false;
+        }
+
+        $fileRepository = $this->getFileRepository($server);
+        $isWhitelistCorrupted = false;
+        $entries = $this->readWhitelistEntries($fileRepository, $isWhitelistCorrupted);
+
+        if ($isWhitelistCorrupted) {
+            return $this->sendRconCommand($serverId, "whitelist add {$playerName}") !== null;
+        }
+
+        $lowerPlayerName = strtolower($playerName);
+
+        foreach ($entries as $entry) {
+            if (!is_array($entry)) {
+                continue;
+            }
+
+            if (strtolower((string) ($entry['name'] ?? '')) === $lowerPlayerName) {
+                return true;
+            }
+        }
+
+        $uuid = $this->resolveUuidFromUsercache($fileRepository, $playerName);
+        if (!$uuid) {
+            return $this->sendRconCommand($serverId, "whitelist add {$playerName}") !== null;
+        }
+
+        $entries[] = [
+            'uuid' => $uuid,
+            'name' => $playerName,
+        ];
+
+        if ($this->writeJsonFile($fileRepository, 'whitelist.json', $entries)) {
+            $this->forgetOnlinePlayersCache($server);
+            return true;
+        }
+
+        return $this->sendRconCommand($serverId, "whitelist add {$playerName}") !== null;
+    }
+
+    public function removeFromWhitelist(string $serverId, string $playerName): bool
+    {
+        $server = $this->resolveServer($serverId, true);
+        if (!$server) {
+            return false;
+        }
+
+        $fileRepository = $this->getFileRepository($server);
+        $isWhitelistCorrupted = false;
+        $entries = $this->readWhitelistEntries($fileRepository, $isWhitelistCorrupted);
+
+        if ($isWhitelistCorrupted) {
+            return $this->sendRconCommand($serverId, "whitelist remove {$playerName}") !== null;
+        }
+
+        $lowerPlayerName = strtolower($playerName);
+
+        $filteredEntries = array_values(array_filter($entries, static function ($entry) use ($lowerPlayerName) {
+            if (!is_array($entry)) {
+                return true;
+            }
+
+            return strtolower((string) ($entry['name'] ?? '')) !== $lowerPlayerName;
+        }));
+
+        if ($this->writeJsonFile($fileRepository, 'whitelist.json', $filteredEntries)) {
+            $this->forgetOnlinePlayersCache($server);
+            return true;
+        }
+
+        return $this->sendRconCommand($serverId, "whitelist remove {$playerName}") !== null;
+    }
+
     public function getServerProperties(string $serverId): array
     {
         $server = $this->resolveServer($serverId, true);
@@ -243,16 +396,40 @@ class MinecraftPlayerProvider implements GamePlayerService
 
     private function getOnlinePlayers(Server $server): array
     {
-        $onlineByRcon = [];
-        if ($this->isRconEnabled()) {
-            $onlineByRcon = $this->getOnlinePlayersViaRcon($server);
+        $cacheKey = $this->getOnlinePlayersCacheKey($server);
+        $onlinePlayers = [];
+
+        try {
+            $onlinePlayers = Cache::remember(
+                $cacheKey,
+                now()->addSeconds(self::ONLINE_PLAYERS_CACHE_SECONDS),
+                fn () => $this->getOnlinePlayersViaQuery($server)
+            );
+        } catch (Throwable $e) {
+            Log::debug('Minecraft online players cache failed: ' . $e->getMessage());
         }
 
-        if (!empty($onlineByRcon)) {
-            return $onlineByRcon;
+        if (!empty($onlinePlayers)) {
+            return $onlinePlayers;
         }
 
-        return $this->getOnlinePlayersViaQuery($server);
+        if (!$this->isRconEnabled()) {
+            return $onlinePlayers;
+        }
+
+        $rconCacheKey = $this->getOnlinePlayersRconFallbackCacheKey($server);
+
+        try {
+            return Cache::remember(
+                $rconCacheKey,
+                now()->addSeconds(self::ONLINE_PLAYERS_RCON_FALLBACK_CACHE_SECONDS),
+                fn () => $this->getOnlinePlayersViaRcon($server)
+            );
+        } catch (Throwable $e) {
+            Log::debug('Minecraft online players RCON fallback cache failed: ' . $e->getMessage());
+        }
+
+        return $this->getOnlinePlayersViaRcon($server);
     }
 
     private function getOnlinePlayersViaRcon(Server $server): array
@@ -486,9 +663,16 @@ class MinecraftPlayerProvider implements GamePlayerService
 
         $hosts = $this->getRconHostsToTry($server, $config);
         $lastError = '';
+        $usePersistentRconConnection = $this->shouldUsePersistentRconConnection();
 
         foreach ($hosts as $host) {
-            $rcon = new RconService($host, (int) $config['port'], (string) $config['password'], 3);
+            $rcon = new RconService(
+                $host,
+                (int) $config['port'],
+                (string) $config['password'],
+                3,
+                $usePersistentRconConnection
+            );
             if (!$rcon->connect()) {
                 $lastError = $rcon->getLastError();
                 continue;
@@ -569,6 +753,56 @@ class MinecraftPlayerProvider implements GamePlayerService
         })));
     }
 
+    private function getOnlinePlayersCacheKey(Server $server): string
+    {
+        return 'minecraft-player-manager:online:' . (string) ($server->uuid ?? 'unknown');
+    }
+
+    private function getOnlinePlayersRconFallbackCacheKey(Server $server): string
+    {
+        return $this->getOnlinePlayersCacheKey($server) . ':rcon-fallback';
+    }
+
+    private function forgetOnlinePlayersCache(Server $server): void
+    {
+        try {
+            Cache::forget($this->getOnlinePlayersCacheKey($server));
+            Cache::forget($this->getOnlinePlayersRconFallbackCacheKey($server));
+        } catch (Throwable $e) {
+            // Cache invalidation should never block whitelist updates.
+        }
+    }
+
+    private function shouldUseRconForLiveDetails(): bool
+    {
+        if (!$this->isRconEnabled()) {
+            return false;
+        }
+
+        $value = env('MC_PLAYER_MANAGER_RCON_LIVE_DETAILS', true);
+
+        if (is_bool($value)) {
+            return $value;
+        }
+
+        return in_array(strtolower((string) $value), ['1', 'true', 'yes', 'on'], true);
+    }
+
+    private function shouldUsePersistentRconConnection(): bool
+    {
+        if (!$this->isRconEnabled()) {
+            return false;
+        }
+
+        $value = env('MC_PLAYER_MANAGER_RCON_PERSISTENT', true);
+
+        if (is_bool($value)) {
+            return $value;
+        }
+
+        return in_array(strtolower((string) $value), ['1', 'true', 'yes', 'on'], true);
+    }
+
     private function isRconEnabled(): bool
     {
         $value = env('MC_PLAYER_MANAGER_RCON_ENABLED', false);
@@ -620,6 +854,30 @@ class MinecraftPlayerProvider implements GamePlayerService
         return $names;
     }
 
+    /**
+     * @return array<string, string>
+     */
+    private function readWhitelistNames($fileRepository): array
+    {
+        $entries = $this->readWhitelistEntries($fileRepository);
+        $names = [];
+
+        foreach ($entries as $entry) {
+            if (!is_array($entry)) {
+                continue;
+            }
+
+            $name = $entry['name'] ?? null;
+            if (!is_string($name) || $name === '') {
+                continue;
+            }
+
+            $names[strtolower($name)] = $name;
+        }
+
+        return $names;
+    }
+
     private function resolveUuidFromUsercache($fileRepository, string $playerId): ?string
     {
         $entries = $this->readJsonFile($fileRepository, 'usercache.json');
@@ -636,6 +894,23 @@ class MinecraftPlayerProvider implements GamePlayerService
             if (strtolower($name) === $lowerPlayerId) {
                 return $uuid;
             }
+        }
+
+        return null;
+    }
+
+    private function resolveLastSeenFromUsercache($fileRepository, string $playerId): ?string
+    {
+        $entries = $this->readJsonFile($fileRepository, 'usercache.json');
+        $lowerPlayerId = strtolower($playerId);
+
+        foreach ($entries as $entry) {
+            $name = $entry['name'] ?? null;
+            if (!is_string($name) || strtolower($name) !== $lowerPlayerId) {
+                continue;
+            }
+
+            return $this->parseLastSeenFromUserCache($entry['expiresOn'] ?? null);
         }
 
         return null;
@@ -665,7 +940,7 @@ class MinecraftPlayerProvider implements GamePlayerService
         }
 
         $ticks = (int) ($custom['minecraft:play_time'] ?? 0);
-        $details['play_time'] = floor($ticks / 20 / 60) . ' ' . __('minecraft-player-manager::messages.units.mins');
+        $details['play_time'] = $this->formatPlayTimeFromTicks($ticks);
         $details['mobs_killed'] = (int) ($custom['minecraft:mob_kills'] ?? 0);
         $details['deaths'] = (int) ($custom['minecraft:deaths'] ?? 0);
 
@@ -685,6 +960,110 @@ class MinecraftPlayerProvider implements GamePlayerService
         } catch (Throwable $e) {
             return [];
         }
+    }
+
+    /**
+     * @param bool|null $isCorrupted Set to true when JSON content exists but is invalid.
+     * @return array<int, array<string, mixed>>
+     */
+    private function readWhitelistEntries($fileRepository, ?bool &$isCorrupted = null): array
+    {
+        $isCorrupted = false;
+
+        try {
+            $content = $fileRepository->getContent('whitelist.json');
+        } catch (Throwable $e) {
+            return [];
+        }
+
+        if (!is_string($content) || trim($content) === '') {
+            return [];
+        }
+
+        $decoded = json_decode($content, true);
+        if (!is_array($decoded)) {
+            $isCorrupted = true;
+            Log::warning('Whitelist file is invalid JSON. Falling back to RCON whitelist commands.');
+            return [];
+        }
+
+        return $decoded;
+    }
+
+    private function parseLastSeenFromUserCache($expiresOn): ?string
+    {
+        if (!is_string($expiresOn) || trim($expiresOn) === '') {
+            return null;
+        }
+
+        try {
+            // Mojang usercache stores an expiration date (~30 days window).
+            // We estimate the last seen timestamp by subtracting 30 days.
+            $estimatedLastSeen = Carbon::parse($expiresOn)->subDays(30);
+            $now = Carbon::now();
+
+            if ($estimatedLastSeen->greaterThan($now)) {
+                return $now->toIso8601String();
+            }
+
+            return $estimatedLastSeen->toIso8601String();
+        } catch (Throwable $e) {
+            return null;
+        }
+    }
+
+    private function formatPlayTimeFromTicks(int $ticks): string
+    {
+        $totalMinutes = (int) floor(max($ticks, 0) / 20 / 60);
+        $days = intdiv($totalMinutes, 1440);
+        $hours = intdiv($totalMinutes % 1440, 60);
+        $minutes = $totalMinutes % 60;
+
+        $parts = [];
+        if ($days > 0) {
+            $parts[] = $days . 'd';
+        }
+
+        if ($hours > 0) {
+            $parts[] = $hours . 'h';
+        }
+
+        if ($minutes > 0 || empty($parts)) {
+            $parts[] = $minutes . 'm';
+        }
+
+        return implode(' ', $parts);
+    }
+
+    /**
+     * @param array<int, array<string, mixed>> $entries
+     */
+    private function writeJsonFile($fileRepository, string $path, array $entries): bool
+    {
+        $content = json_encode(array_values($entries), JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES);
+        if ($content === false) {
+            return false;
+        }
+
+        $content .= PHP_EOL;
+        $writeMethods = ['putContent', 'updateContent', 'writeContent', 'setContent', 'saveContent'];
+
+        foreach ($writeMethods as $method) {
+            if (!method_exists($fileRepository, $method)) {
+                continue;
+            }
+
+            try {
+                $result = $fileRepository->{$method}($path, $content);
+                if ($result !== false) {
+                    return true;
+                }
+            } catch (Throwable $e) {
+                // Try the next available write method.
+            }
+        }
+
+        return false;
     }
 
     /**

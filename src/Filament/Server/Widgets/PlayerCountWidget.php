@@ -9,6 +9,11 @@ use Filament\Facades\Filament;
 
 class PlayerCountWidget extends BaseWidget
 {
+    protected function getPollingInterval(): ?string
+    {
+        return '10s';
+    }
+
     protected function getStats(): array
     {
         $server = Filament::getTenant();

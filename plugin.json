@@ -6,7 +6,7 @@
     "url": "https://github.com/kumagames-fou/minecraft-player-manager",
     "update_url": null,
     "version": "1.4.1",
-    "author": "KumaGames",
+    "author": "KumaGames & ZeroxarZ",
     "namespace": "KumaGames\\GamePlayerManager",
     "class": "GamePlayerManagerPlugin",
     "panels": [

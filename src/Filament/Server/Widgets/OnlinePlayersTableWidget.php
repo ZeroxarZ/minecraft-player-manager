@@ -12,6 +12,11 @@ use Filament\Actions\Action;
 
 class OnlinePlayersTableWidget extends BaseWidget
 {
+    protected function getPollingInterval(): ?string
+    {
+        return '10s';
+    }
+
     public static function canView(): bool
     {
         /** @var \App\Models\Server $server */

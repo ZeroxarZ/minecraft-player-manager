@@ -9,6 +9,7 @@ class RconService
     private $port;
     private $password;
     private $timeout;
+    private $persistentConnection;
     private $authorized = false;
     private $lastError = '';
 
@@ -17,18 +18,23 @@ class RconService
     const SERVERDATA_RESPONSE_VALUE = 0;
     const SERVERDATA_AUTH_RESPONSE = 2;
 
-    public function __construct(string $host, int $port, string $password, int $timeout = 3)
+    public function __construct(string $host, int $port, string $password, int $timeout = 3, bool $persistentConnection = false)
     {
         $this->host = $host;
         $this->port = $port;
         $this->password = $password;
         $this->timeout = $timeout;
+        $this->persistentConnection = $persistentConnection;
     }
 
     public function connect(): bool
     {
         try {
-            $this->socket = @fsockopen($this->host, $this->port, $errno, $errstr, $this->timeout);
+            if ($this->persistentConnection) {
+                $this->socket = @pfsockopen($this->host, $this->port, $errno, $errstr, $this->timeout);
+            } else {
+                $this->socket = @fsockopen($this->host, $this->port, $errno, $errstr, $this->timeout);
+            }
 
             if (!$this->socket) {
                 $this->lastError = "Connection failed: $errno - $errstr";
@@ -53,8 +59,12 @@ class RconService
     public function disconnect()
     {
         if ($this->socket) {
-            fclose($this->socket);
+            // Keep persistent sockets in the PHP-FPM pool for reuse.
+            if (!$this->persistentConnection) {
+                fclose($this->socket);
+            }
             $this->socket = null;
+            $this->authorized = false;
         }
     }
 

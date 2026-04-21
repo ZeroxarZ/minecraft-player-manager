@@ -5,10 +5,10 @@ namespace KumaGames\GamePlayerManager\Filament\Server\Resources;
 use Filament\Resources\Resource;
 use Filament\Tables;
 use Filament\Tables\Table;
+use Illuminate\Support\Carbon;
 use KumaGames\GamePlayerManager\Filament\Server\Resources\PlayerResource\Pages;
 use KumaGames\GamePlayerManager\Services\MinecraftPlayerProvider;
 use Filament\Actions\Action;
-use Filament\Actions\ViewAction;
 use Filament\Facades\Filament;
 
 class PlayerResource extends Resource
@@ -45,6 +45,7 @@ class PlayerResource extends Resource
     public static function table(Table $table): Table
     {
         return $table
+            ->poll('10s')
             ->columns([
                 Tables\Columns\ImageColumn::make('avatar')
                     ->label('')
@@ -86,6 +87,42 @@ class PlayerResource extends Resource
                 Tables\Columns\IconColumn::make('is_op')
                      ->boolean()
                      ->label(__('minecraft-player-manager::messages.columns.op')),
+
+                Tables\Columns\TextColumn::make('is_whitelisted')
+                    ->label('Whitelist')
+                    ->badge()
+                    ->state(fn ($record): string => !empty($record['is_whitelisted']) ? 'Whitelisted' : 'Not whitelisted')
+                    ->color(fn (string $state): string => $state === 'Whitelisted' ? 'success' : 'gray'),
+
+                Tables\Columns\TextColumn::make('last_connection_at')
+                    ->label('Last Connection')
+                    ->state(fn ($record) => $record['last_connection_at'] ?? null)
+                    ->formatStateUsing(function ($state): string {
+                        if (!is_string($state) || trim($state) === '') {
+                            return '-';
+                        }
+
+                        try {
+                            return Carbon::parse($state)->diffForHumans();
+                        } catch (\Throwable $e) {
+                            return '-';
+                        }
+                    }),
+
+                Tables\Columns\TextColumn::make('last_activity_at')
+                    ->label('Last Activity')
+                    ->state(fn ($record) => $record['last_activity_at'] ?? null)
+                    ->formatStateUsing(function ($state): string {
+                        if (!is_string($state) || trim($state) === '') {
+                            return '-';
+                        }
+
+                        try {
+                            return Carbon::parse($state)->diffForHumans();
+                        } catch (\Throwable $e) {
+                            return '-';
+                        }
+                    }),
             ])
             ->actions([
                  Action::make('view_details')
@@ -114,6 +151,46 @@ class PlayerResource extends Resource
                             ->title($record->is_op ? __('minecraft-player-manager::messages.actions.op.notify_deop') : __('minecraft-player-manager::messages.actions.op.notify_op'))
                             ->success()
                             ->send();
+                    })
+                    ->requiresConfirmation(),
+
+                Action::make('whitelist')
+                    ->label(fn ($record) => $record->is_whitelisted ? 'Remove whitelist' : 'Add whitelist')
+                    ->color(fn ($record) => $record->is_whitelisted ? 'gray' : 'success')
+                    ->icon(fn ($record) => $record->is_whitelisted ? 'heroicon-m-no-symbol' : 'heroicon-m-check-badge')
+                    ->button()
+                    ->action(function ($record, $livewire) {
+                        if (!$record) return;
+
+                        $server = \Filament\Facades\Filament::getTenant();
+                        if (!$server) return;
+
+                        $provider = app(MinecraftPlayerProvider::class);
+                        $success = false;
+                        $isWhitelisted = !empty($record->is_whitelisted);
+
+                        if ($isWhitelisted) {
+                            $success = $provider->removeFromWhitelist($server->uuid, $record->name);
+                        } else {
+                            $success = $provider->addToWhitelist($server->uuid, $record->name);
+                        }
+
+                        \Filament\Notifications\Notification::make()
+                            ->title($success
+                                ? ($isWhitelisted ? 'Player removed from whitelist' : 'Player added to whitelist')
+                                : 'Whitelist update failed')
+                            ->success($success)
+                            ->danger(! $success)
+                            ->send();
+
+                        // ListPlayers keeps a local cache; invalidate it after toggle.
+                        if (is_object($livewire) && method_exists($livewire, 'refreshPlayersList')) {
+                            $livewire->refreshPlayersList();
+                        }
+
+                        if (is_object($livewire) && method_exists($livewire, 'dispatch')) {
+                            $livewire->dispatch('$refresh');
+                        }
                     })
                     ->requiresConfirmation(),
 
@@ -178,7 +255,35 @@ class PlayerResource extends Resource
                                 default => $state,
                             }),
                         \Filament\Forms\Components\TextInput::make('uuid')->label(__('minecraft-player-manager::messages.fields.uuid'))->disabled(),
-                    ])->columns(3),
+                        \Filament\Forms\Components\TextInput::make('last_connection_at')
+                            ->label('Last Connection')
+                            ->disabled()
+                            ->formatStateUsing(function ($state): string {
+                                if (!is_string($state) || trim($state) === '') {
+                                    return '-';
+                                }
+
+                                try {
+                                    return Carbon::parse($state)->diffForHumans();
+                                } catch (\Throwable $e) {
+                                    return '-';
+                                }
+                            }),
+                        \Filament\Forms\Components\TextInput::make('last_activity_at')
+                            ->label('Last Activity')
+                            ->disabled()
+                            ->formatStateUsing(function ($state): string {
+                                if (!is_string($state) || trim($state) === '') {
+                                    return '-';
+                                }
+
+                                try {
+                                    return Carbon::parse($state)->diffForHumans();
+                                } catch (\Throwable $e) {
+                                    return '-';
+                                }
+                            }),
+                    ])->columns(5),
 
                 // 2. Historical Stats (Grid)
                 \Filament\Schemas\Components\Section::make(__('minecraft-player-manager::messages.sections.statistics'))
