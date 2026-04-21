@@ -111,4 +111,3 @@ Check:
 * Designed for **Pelican Panel environments**
 * Works best with properly configured **RCON**
 
-```
